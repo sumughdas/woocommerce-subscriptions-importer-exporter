@@ -226,8 +226,8 @@ class WCS_Importer {
 					$title          = ( ! empty( $data[ self::$fields['payment_method_title'] ] ) ) ? $data[ self::$fields['payment_method_title'] ] : $payment_method;
 
 					if ( ! empty( $payment_method ) && 'manual' != $payment_method ) {
-						$post_meta[] = array( 'key' => '_' . $column, 'value' => $payment_method );
-						$post_meta[] = array( 'key' => '_payment_method_title', 'value' => $title );
+						// $post_meta[] = array( 'key' => '_' . $column, 'value' => $payment_method );
+						// $post_meta[] = array( 'key' => '_payment_method_title', 'value' => $title );
 					} else {
 						$set_manual = true;
 					}
@@ -376,6 +376,64 @@ class WCS_Importer {
 
 					if ( ! $set_manual && ! in_array( $status, wcs_get_subscription_ended_statuses() ) ) { // don't bother trying to set payment meta on a subscription that won't ever renew
 						$result['warning'] = array_merge( $result['warning'], self::set_payment_meta( $subscription, $data ) );
+						if ( 'authorize_net_cim_credit_card' === $data["payment_method"] ) {
+							$payment_method_meta = $data["payment_method_post_meta"];
+							if ( ! empty( $payment_method_meta ) ) {
+								foreach ( explode( '|', $payment_method_meta ) as $token_item ) {
+									list( $name, $value ) = explode( ':', $token_item );
+									$token_data[ trim( $name ) ] = trim( $value );
+								}
+							}
+
+							$token_string = $data['token_data'];
+							if ( ! empty( $token_string ) ) {
+								foreach ( explode( '|', $token_string ) as $token_item ) {
+									list( $name, $value ) = explode( ':', $token_item );
+									$token_data[ trim( $name ) ] = trim( $value );
+								}
+							}
+
+							global $wpdb;
+							$token_table_name      = $wpdb->prefix . 'woocommerce_payment_tokens';
+							$token                 = $token_data['_wc_authorize_net_cim_credit_card_payment_token'];
+
+							$cc_tokens = get_user_meta($user_id, '_wc_authorize_net_cim_credit_card_payment_tokens', true);
+							$cc_tokens = ! empty( $cc_tokens ) ? $cc_tokens : array();
+							delete_user_meta( $user_id, '_wc_authorize_net_cim_credit_card_payment_tokens_migrated', 'yes' );
+
+							$$billing = array(
+									'first_name' => $subscription->get_billing_first_name(),
+									'last_name'  => $subscription->get_billing_last_name(),
+									'company'    => $subscription->get_billing_company(),
+									'address'    => trim( $subscription->get_billing_address_1() . ' ' . $subscription->get_billing_address_2() ),
+									'city'       => $subscription->get_billing_city(),
+									'state'      => $subscription->get_billing_state(),
+									'postcode'   => $subscription->get_billing_postcode(),
+									'country'    => $subscription->get_billing_country(),
+									'phone'      => $subscription->get_billing_phone(),
+							);
+							$billing_hash = md5( json_encode( $billing ) );
+
+							$payment = array(
+								'last_four' => $token_data['last_four'],
+								'type'      => $token_data['card_type'],
+								'postcode'  => $subscription->get_billing_postcode(),
+							);
+							$payment_hash = md5( json_encode( $payment ) );
+
+							$cc_tokens[ $token_data['_wc_authorize_net_cim_credit_card_payment_token'] ] = array(
+								'type'                => 'credit_card',
+								'last_four'           => ! empty( $token_data['last_four'] ) ? $token_data['last_four'] : '',
+								'customer_profile_id' => $token_data['_wc_authorize_net_cim_credit_card_customer_id'],
+								'billing_hash'        => $billing_hash,
+								'payment_hash'        => $payment_hash,
+								'default'             => true,
+								'card_type'           => $token_data['card_type'],
+								'exp_month'           => $token_data['exp_month'],
+								'exp_year'            => $token_data['exp_year']
+							);
+							update_user_meta( $user_id, '_wc_authorize_net_cim_credit_card_payment_tokens', $cc_tokens );
+						}
 					}
 
 					if ( $set_manual || $requires_manual_renewal ) {
@@ -540,7 +598,8 @@ class WCS_Importer {
 		$warnings         = array();
 		$payment_gateways = WC()->payment_gateways->get_available_payment_gateways();
 		$subscription_id  = version_compare( WC()->version, '3.0', '>=' ) ? $subscription->get_id() : $subscription->id;
-		$payment_method   = version_compare( WC()->version, '3.0', '>=' ) ? $subscription->get_payment_method() : $subscription->payment_method;
+		// $payment_method   = version_compare( WC()->version, '3.0', '>=' ) ? $subscription->get_payment_method() : $subscription->payment_method;
+		$payment_method   = ! empty( $data["payment_method"] ) && 'manual' != $data["payment_method"] ? $data["payment_method"] : '';
 
 		if ( ! empty( $payment_method ) ) {
 			$payment_method_table = apply_filters( 'woocommerce_subscription_payment_meta', array(), $subscription );
@@ -597,6 +656,23 @@ class WCS_Importer {
 					$subscription  = wcs_get_subscription( $subscription->get_id() );
 					$subscription->set_payment_method( $payment_gateway, $payment_method_data );
 					$subscription->save();
+
+					$parent_order = wcs_create_order_from_subscription( $subscription, 'parent' );
+					$subscription->set_parent_id( wcs_get_objects_property( $parent_order, 'id' ) );
+					// $subscription->save();
+
+					if ( ! $subscription->is_manual() ) {
+
+						$parent_order->set_payment_method( wc_get_payment_gateway_by_order( $subscription ) ); // We need to pass the payment gateway instance to be compatible with WC < 3.0, only WC 3.0+ supports passing the string name
+
+						if ( is_callable( array( $parent_order, 'save' ) ) ) { // WC 3.0+
+							$parent_order->save();
+						}
+					}
+
+					wc_maybe_reduce_stock_levels( $parent_order );
+					$subscription->add_order_note( __( 'Create pending parent order requested by admin action.', 'woocommerce-subscriptions' ), false, true );
+
 				} else {
 					$warnings[] = sprintf( esc_html__( 'No payment meta was set for your %1$s subscription (%2$s). The next renewal is going to fail if you leave this.', 'wcs-import-export' ), $payment_method, $subscription_id );
 				}
